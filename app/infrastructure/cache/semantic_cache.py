@@ -8,6 +8,8 @@
     1. 只缓存检索/咨询类问句。下单、取消这类写操作意图一律不进缓存——
        同样的话第二次说，业务含义可能完全不同（比如再下一单）。
     2. 按 buyer 分桶。买家 A 的回复里可能含其偏好与地址，不能给买家 B 复用。
+    2b. 桶 key 还带买家的**偏好指纹**（scope）：回复是在当时偏好下生成的，
+        偏好新增或撤回后，旧回复必须自动失效（否则会拿已删偏好当卖点说给用户）。
     3. 会话内已有多轮上下文时不命中。"刚才那款多少钱"依赖上下文，
        跨会话复用会答错。
     4. namespace 带模型名与提示词指纹：改 prompt / 换模型后旧缓存自动作废。
@@ -96,23 +98,43 @@ class SemanticCache:
     def enabled(self) -> bool:
         return self._enabled
 
-    def _bucket_key(self, buyer_id: str) -> str:
-        digest = hashlib.sha256(f"{self._namespace}\n{buyer_id}".encode()).hexdigest()[:16]
+    def _bucket_key(self, buyer_id: str, scope: str = "") -> str:
+        """桶 key = namespace + buyer_id + scope。
+
+        scope 用来装载“会改变回复内容的买家侧状态”，目前是长期偏好指纹。
+
+        为何必须：回复是在“当时的偏好”下生成的。买家把“不要塑料”撤回后再问一句
+        语义相近的话，若桶 key 不含偏好指纹，就会命中撤回前的旧回复——里面还写着
+        “符合您不要塑料的偏好”，直接向用户断言了一条它刚删掉的偏好。实测踩过。
+        """
+        digest = hashlib.sha256(
+            f"{self._namespace}\n{self._prompt_version()}\n{buyer_id}\n{scope}".encode(),
+        ).hexdigest()[:16]
         return f"semcache:{digest}"
 
-    async def _load_entries(self, buyer_id: str) -> list:
+    @staticmethod
+    def _prompt_version() -> str:
+        from app.infrastructure.context import ShoppingContext
+        snapshot = ShoppingContext.current()
+        if snapshot is None:
+            return ""
+        return snapshot.prompt_version + ":" + getattr(snapshot, "capability_digest", "")
+
+    async def _load_entries(self, buyer_id: str, scope: str = "") -> list:
         """读桶；缓存异常一律当空桶（纵深防御，不依赖底层一定吞异常）。"""
         try:
-            entries = await self._cache.get_json(self._bucket_key(buyer_id))
+            entries = await self._cache.get_json(self._bucket_key(buyer_id, scope))
         except Exception as err:  # noqa: BLE001
             logger.warning("语义缓存读异常，按未命中处理：%s", err)
             return []
         return entries if isinstance(entries, list) else []
 
-    async def lookup(self, buyer_id: str, query: str, has_history: bool) -> Optional[SemanticHit]:
+    async def lookup(
+        self, buyer_id: str, query: str, has_history: bool, scope: str = "",
+    ) -> Optional[SemanticHit]:
         if not self._enabled or has_history or not is_cacheable_query(query):
             return None
-        entries = await self._load_entries(buyer_id)
+        entries = await self._load_entries(buyer_id, scope)
         if not entries:
             return None
 
@@ -133,7 +155,9 @@ class SemanticCache:
                 )
         return best if best and best.reply else None
 
-    async def remember(self, buyer_id: str, query: str, reply: str, has_history: bool) -> None:
+    async def remember(
+        self, buyer_id: str, query: str, reply: str, has_history: bool, scope: str = "",
+    ) -> None:
         if not self._enabled or has_history or not is_cacheable_query(query):
             return
         if not reply or reply.startswith("[error]"):
@@ -144,8 +168,8 @@ class SemanticCache:
             logger.warning("语义缓存写向量失败，跳过：%s", err)
             return
 
-        key = self._bucket_key(buyer_id)
-        entries = await self._load_entries(buyer_id)
+        key = self._bucket_key(buyer_id, scope)
+        entries = await self._load_entries(buyer_id, scope)
         entries.append({"query": _normalize(query), "reply": reply, "vector": vector})
         try:
             await self._cache.set_json(key, entries[-_BUCKET_LIMIT:], _TTL_SECONDS)

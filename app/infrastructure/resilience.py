@@ -24,6 +24,7 @@ from agentscope.tool import ToolBase, ToolChunk, ToolMiddlewareBase
 
 from app.infrastructure.context import ShoppingContext
 from app.infrastructure.eventbus import TradeEventBus
+from app.infrastructure.transient import is_transient_error
 
 logger = logging.getLogger(__name__)
 
@@ -95,6 +96,14 @@ class CircuitBreakerRegistry:
 
 
 class ToolResilienceMiddleware(ToolMiddlewareBase):
+    """工具超时 + 熔断中间件。
+
+    熔断注册表可以是进程内的 `CircuitBreakerRegistry`，
+    也可以是 Redis 支撑的 `SharedCircuitBreakerRegistry`（跨实例共享）。
+    后者的读写是异步的，故这里统一走 `_allow` / `_record_*` 三个适配函数：
+    注册表提供 `*_async` 时优先 await 它，否则回落同步方法。
+    """
+
     def __init__(
         self,
         registry: CircuitBreakerRegistry,
@@ -125,7 +134,7 @@ class ToolResilienceMiddleware(ToolMiddlewareBase):
     ) -> AsyncGenerator[ToolChunk, None]:
         tool_name = tool.name
 
-        if not self._registry.allow(tool_name):
+        if not await _allow(self._registry, tool_name):
             detail = f"{tool_name} 连续失败已熔断，暂不可用，请稍后再试或改用其他方式"
             logger.warning("工具熔断短路：%s", tool_name)
             self._publish_circuit(tool_name, "open", detail)
@@ -148,31 +157,71 @@ class ToolResilienceMiddleware(ToolMiddlewareBase):
 
             chunks = await asyncio.wait_for(_collect(), timeout=timeout)
         except asyncio.TimeoutError:
-            self._registry.record_failure(tool_name)
+            await _record_failure(self._registry, tool_name)
             detail = f"{tool_name} 执行超过 {timeout:.0f} 秒已中断"
             logger.warning("工具超时：%s（%.0fs）", tool_name, timeout)
-            self._publish_circuit(tool_name, self._registry.status(tool_name), detail)
+            self._publish_circuit(tool_name, await _status(self._registry, tool_name), detail)
             yield ToolChunk(
                 content=[TextBlock(type="text", text=f"[error] {detail}")],
                 state=ToolResultState.ERROR,
             )
             return
         except Exception as err:  # noqa: BLE001 —— 未捕获异常也计入失败并降级
-            self._registry.record_failure(tool_name)
+            await _record_failure(self._registry, tool_name)
             detail = f"{tool_name} 执行异常：{err}"
             logger.warning("工具异常：%s（%s）", tool_name, err)
-            self._publish_circuit(tool_name, self._registry.status(tool_name), detail)
+            self._publish_circuit(tool_name, await _status(self._registry, tool_name), detail)
             yield ToolChunk(
                 content=[TextBlock(type="text", text=f"[error] {detail}")],
                 state=ToolResultState.ERROR,
             )
             return
 
-        # 工具自身返回 ERROR 也计入连续失败（如下游 5xx 持续报错）
-        if chunks and chunks[-1].state == ToolResultState.ERROR:
-            self._registry.record_failure(tool_name)
+        # 只有瞬时基础设施错误才计入熔断。参数校验、目的国不支持、订单不存在等
+        # 确定性业务错误说明工具本身仍然健康，不能让一批坏请求毒死后续正常流量。
+        if chunks and chunks[-1].state == ToolResultState.ERROR and _is_transient_tool_error(chunks[-1]):
+            await _record_failure(self._registry, tool_name)
         else:
-            self._registry.record_success(tool_name)
+            await _record_success(self._registry, tool_name)
 
         for chunk in chunks:
             yield chunk
+
+
+def _is_transient_tool_error(chunk: ToolChunk) -> bool:
+    texts: list[str] = []
+    for block in chunk.content or []:
+        if isinstance(block, dict):
+            texts.append(str(block.get("text", "")))
+        else:
+            texts.append(str(getattr(block, "text", "")))
+    return is_transient_error(RuntimeError("\n".join(texts)))
+
+
+# ---- 注册表适配：共享实现的读写是异步的，本地实现是同步的 ----
+
+
+async def _allow(registry: Any, tool_name: str) -> bool:
+    if hasattr(registry, "allow_async"):
+        return await registry.allow_async(tool_name)
+    return registry.allow(tool_name)
+
+
+async def _record_failure(registry: Any, tool_name: str) -> None:
+    if hasattr(registry, "record_failure_async"):
+        await registry.record_failure_async(tool_name)
+        return
+    registry.record_failure(tool_name)
+
+
+async def _record_success(registry: Any, tool_name: str) -> None:
+    if hasattr(registry, "record_success_async"):
+        await registry.record_success_async(tool_name)
+        return
+    registry.record_success(tool_name)
+
+
+async def _status(registry: Any, tool_name: str) -> str:
+    if hasattr(registry, "status_async"):
+        return await registry.status_async(tool_name)
+    return registry.status(tool_name)

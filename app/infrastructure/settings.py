@@ -11,15 +11,28 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from dotenv import load_dotenv
 
+from app.infrastructure.langfuse_config import LANGFUSE_FIELDS, LangfuseConfig
+
 # 项目根目录（globex-agent/）
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 
-load_dotenv(PROJECT_ROOT / ".env")
+def _load_environment(path: Path) -> None:
+    # 先保护三项 Langfuse 原文，避免通用 dotenv 将 ${OTHER_SECRET} 展开。
+    # setdefault 保持真实进程环境优先，其余业务配置沿用原插值语义。
+    if path.is_file():
+        langfuse = LangfuseConfig.from_env(path, environ={})
+        for name, value in zip(LANGFUSE_FIELDS, (langfuse.base_url, langfuse.public_key, langfuse.secret_key)):
+            if value:
+                os.environ.setdefault(name, value)
+    load_dotenv(path)
+
+
+_load_environment(PROJECT_ROOT / ".env")
 
 
 @dataclass(frozen=True)
@@ -47,7 +60,7 @@ class Settings:
     category_kb_collection: str
     # ---- 三期：Context 工程 ----
     context_size: int  # 模型上下文窗口，压缩阈值按此比例计算
-    tool_result_limit: int  # 单个工具结果字符上限（商品卡 JSON 较大，需比默认收紧）
+    tool_result_limit: int  # 单个工具结果 token 上限（AgentScope 2.0.6 口径）
     reply_token_budget: int  # 0 = 不启用 Token 预算护栏
     # ---- 三期：工具韧性 ----
     tool_failure_threshold: int  # 连续失败达阈值后熔断
@@ -74,6 +87,36 @@ class Settings:
     queue_enabled: bool = True  # 需同时配上 REDIS_URL 才生效；否则意图在 API 进程内直跑
     queue_wait_seconds: float = 300.0  # 同步接口等待队列结果的上限
     worker_concurrency: int = 2  # 单个 worker 同时处理的任务数
+    # ---- 五期：运行时护栏（Harness / 安全 / 预算）----
+    # 默认值取向：零成本的纯本地护栏默认开，
+    # 会额外调模型或改变模型选择的一律默认关，必须是显式开启的选择。
+    harness_enabled: bool = True  # 单步断言 + 循环检测 + L3 内容过滤
+    loop_repeat_threshold: int = 3  # 同一工具连续调用达此数即注入收敛提示
+    output_guard_enabled: bool = True  # L4 输出审核（纯正则）
+    drift_detect_enabled: bool = False  # 需额外轻量 LLM 调用，默认关
+    token_budget_total: int = 0  # 0 = 不启用请求级 Token 预算与四档降级
+    breaker_shared: bool = False  # 熔断状态跨实例共享（需 REDIS_URL）
+    # 长期记忆：偏好注入策略
+    preference_relevance_enabled: bool = False  # 向量相关性筛选，每轮多一次 embedding，默认关
+    preference_top_k: int = 5  # like 注入上限；dislike（黑名单）不受此限
+    preference_subagent_inject: bool = True  # 给检索子 Agent 注入偏好（纯本地拼装，零成本）
+    queue_priority_enabled: bool = True  # 双队列优先级（无 Redis 时自动无效）
+    queue_large_request_turns: int = 30  # 对话轮数 >= 此值走大请求队列
+    # OTLP 信号专用配置优先；认证头不可出现在 Settings 的 repr/日志中。
+    otlp_traces_endpoint: str = ""
+    otlp_headers: str = field(default="", repr=False)
+    otlp_traces_headers: str = field(default="", repr=False)
+    langfuse_base_url: str = field(default="", repr=False)
+    langfuse_public_key: str = field(default="", repr=False)
+    langfuse_secret_key: str = field(default="", repr=False)
+    otel_service_name: str = "globex-agent"
+    otlp_timeout_seconds: float = 5.0
+    session_owner_binding: bool = True
+    identity_mode: str = "demo"
+    prompt_pin_version: str = ""
+    metrics_reader_buyers: tuple[str, ...] = ()
+    identity_hmac_secret: str = field(default="", repr=False)
+    hybrid_recall_enabled: bool = False  # 冻结评测证明收益后再启用实验召回
 
 
 def load_settings() -> Settings:
@@ -91,6 +134,7 @@ def load_settings() -> Settings:
         llm_base_url=llm_base_url,
         llm_api_key=llm_api_key,
         llm_model=os.getenv("LLM_MODEL", "qwen3-max"),
+        hybrid_recall_enabled=os.getenv("HYBRID_RECALL_ENABLED", "0") in ("1", "true", "True"),
         port=int(os.getenv("PORT", "8000")),
         log_level=os.getenv("LOG_LEVEL", "info"),
         # embedding 默认复用 LLM 网关（OpenAI 兼容 /v1/embeddings）
@@ -135,4 +179,30 @@ def load_settings() -> Settings:
         queue_enabled=os.getenv("QUEUE_ENABLED", "1") not in ("0", "false", "False"),
         queue_wait_seconds=float(os.getenv("QUEUE_WAIT_SECONDS", "300")),
         worker_concurrency=int(os.getenv("WORKER_CONCURRENCY", "2")),
+        harness_enabled=os.getenv("HARNESS_ENABLED", "1") not in ("0", "false", "False"),
+        loop_repeat_threshold=int(os.getenv("LOOP_REPEAT_THRESHOLD", "3")),
+        output_guard_enabled=os.getenv("OUTPUT_GUARD_ENABLED", "1") not in ("0", "false", "False"),
+        drift_detect_enabled=os.getenv("DRIFT_DETECT_ENABLED", "0") not in ("0", "false", "False"),
+        token_budget_total=int(os.getenv("TOKEN_BUDGET_TOTAL", "0")),
+        breaker_shared=os.getenv("BREAKER_SHARED", "0") not in ("0", "false", "False"),
+        preference_relevance_enabled=os.getenv("PREFERENCE_RELEVANCE_ENABLED", "0")
+        not in ("0", "false", "False"),
+        preference_top_k=int(os.getenv("PREFERENCE_TOP_K", "5")),
+        preference_subagent_inject=os.getenv("PREFERENCE_SUBAGENT_INJECT", "1")
+        not in ("0", "false", "False"),
+        queue_priority_enabled=os.getenv("QUEUE_PRIORITY_ENABLED", "1") not in ("0", "false", "False"),
+        queue_large_request_turns=int(os.getenv("QUEUE_LARGE_REQUEST_TURNS", "30")),
+        otlp_traces_endpoint=os.getenv("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", ""),
+        otlp_headers=os.getenv("OTEL_EXPORTER_OTLP_HEADERS", ""),
+        otlp_traces_headers=os.getenv("OTEL_EXPORTER_OTLP_TRACES_HEADERS", ""),
+        langfuse_base_url=os.getenv("LANGFUSE_BASE_URL", ""),
+        langfuse_public_key=os.getenv("LANGFUSE_PUBLIC_KEY", ""),
+        langfuse_secret_key=os.getenv("LANGFUSE_SECRET_KEY", ""),
+        otel_service_name=os.getenv("OTEL_SERVICE_NAME", "globex-agent"),
+        otlp_timeout_seconds=float(os.getenv("OTEL_EXPORTER_OTLP_TRACES_TIMEOUT") or os.getenv("OTEL_EXPORTER_OTLP_TIMEOUT", "5")),
+        session_owner_binding=os.getenv("SESSION_OWNER_BINDING", "1") not in ("0", "false", "False"),
+        identity_mode=os.getenv("IDENTITY_MODE", "demo"),
+        prompt_pin_version=os.getenv("PROMPT_PIN_VERSION", ""),
+        metrics_reader_buyers=tuple(item.strip() for item in os.getenv("METRICS_READER_BUYERS", "").split(",") if item.strip()),
+        identity_hmac_secret=os.getenv("IDENTITY_HMAC_SECRET", ""),
     )

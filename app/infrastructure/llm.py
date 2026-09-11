@@ -19,23 +19,101 @@ from __future__ import annotations
 import asyncio
 import logging
 import sys
+import time
+from collections.abc import AsyncIterable
+from contextvars import ContextVar
 from typing import Any, AsyncGenerator, Optional
 
 from agentscope.credential import OpenAICredential
-from agentscope.message import Msg
-from agentscope.model import ChatResponse, OpenAIChatModel
+from agentscope.message import Msg, TextBlock
+from agentscope.model import ChatResponse, FinishedReason, OpenAIChatModel
 from agentscope.tool import ToolChoice
 
+from app.infrastructure.budget import current_tier, get_budget, MINIMAL_MODE_HINT, estimate_input_tokens, rule_fallback_text
 from app.infrastructure.context import ShoppingContext
 from app.infrastructure.eventbus import TradeEventBus
+from app.infrastructure.model_stream import StreamFinalizer, current_stream_finalizer
 from app.infrastructure.settings import Settings
 from app.infrastructure.throttle import GatewayThrottle
 from app.infrastructure.transient import is_transient_error
+from app.infrastructure.operational_metrics import observe_model, observe_model_started
 
 logger = logging.getLogger(__name__)
 
 
-class ThrottledChatModel(OpenAIChatModel):
+class BudgetCall:
+    """一个逻辑调用的逐次请求预算；失败重试也要重新预留。"""
+    def __init__(self, messages, tools, kwargs):
+        self.budget = get_budget()
+        self.input_tokens = estimate_input_tokens(messages, tools) if self.budget else 0
+        self.base_input_tokens = self.input_tokens
+        self.minimal_hint_tokens = estimate_input_tokens(
+            [Msg(name="system", content=[TextBlock(text=MINIMAL_MODE_HINT)], role="system")], None,
+        ) if self.budget else 0
+        self.output_limit = min(1024, int(kwargs.get("max_completion_tokens") or kwargs.get("max_tokens") or 1024))
+        self.reservation = None
+        self.tier = current_tier()
+        self.maximum_output = self.output_limit
+        self.started_at = None
+        self.first_text_at = None
+        self.last_usage_response = None
+
+    def mark_started(self):
+        observe_model_started()
+        self.started_at = time.monotonic()
+        self.first_text_at = None
+        self.last_usage_response = None
+
+    def observe_chunk(self, response):
+        if _usage_tokens(response) is not None:
+            self.last_usage_response = response
+        if self.first_text_at is None and any(isinstance(block, TextBlock) and block.text for block in (_safe_field(response, "content") or [])):
+            self.first_text_at = time.monotonic()
+
+    def acquire(self) -> bool:
+        if self.budget is None:
+            return True
+        self.tier = self.budget.tier
+        self.input_tokens = self.base_input_tokens + (self.minimal_hint_tokens if self.tier == "minimal" else 0)
+        self.maximum_output = min(self.output_limit, self.budget.remaining - self.input_tokens)
+        if self.maximum_output < 64:
+            return False
+        self.reservation = self.budget.reserve(self.input_tokens + self.maximum_output)
+        return self.reservation is not None
+
+    def settle(self, response) -> None:
+        self.observe_chunk(response)
+        usage_response = self.last_usage_response or response
+        if self.reservation is not None:
+            self.reservation.settle(_usage_tokens(usage_response))
+            self.reservation = None
+        if self.started_at is not None:
+            usage = _safe_field(usage_response, "usage")
+            input_tokens = _safe_field(usage, "input_tokens")
+            output_tokens = _safe_field(usage, "output_tokens")
+            observe_model(input_tokens=input_tokens if input_tokens is not None else _safe_field(usage, "prompt_tokens"),
+                          output_tokens=output_tokens if output_tokens is not None else _safe_field(usage, "completion_tokens"),
+                          ttft_ms=(self.first_text_at-self.started_at)*1000 if self.first_text_at is not None else None,
+                          elapsed_ms=(time.monotonic()-self.started_at)*1000, cost_usd=None)
+            self.started_at = None
+
+
+_budget_call: ContextVar[BudgetCall | None] = ContextVar("globex_budget_call", default=None)
+
+
+class StreamClosingOpenAIChatModel(OpenAIChatModel):
+    """捕获 SDK 生成器内部的 HTTP stream，让尚未开始读取的流也能显式关闭。"""
+
+    def _parse_stream_response(self, start_datetime, response):
+        parsed = super()._parse_stream_response(start_datetime, response)
+        finalizer = current_stream_finalizer.get()
+        if finalizer is not None:
+            finalizer.add(response)
+            finalizer.add(parsed)
+        return parsed
+
+
+class ThrottledChatModel(StreamClosingOpenAIChatModel):
     """带配额闸门、退避重试与限流回退的 OpenAIChatModel。"""
 
     def __init__(
@@ -62,28 +140,72 @@ class ThrottledChatModel(OpenAIChatModel):
         tool_choice: Optional[ToolChoice] = None,
         **kwargs: Any,
     ) -> ChatResponse | AsyncGenerator[ChatResponse, None]:
+        budget_call = BudgetCall(messages, tools, kwargs)
+        if not budget_call.acquire():
+            return self._budget_fallback()
+        if budget_call.budget is not None:
+            kwargs.pop("max_tokens", None)
+            kwargs["max_completion_tokens"] = budget_call.maximum_output
         # 手动进出上下文而非 async with：流式分支要把名额移交给包装生成器
         slot = self._throttle.slot()
-        await slot.__aenter__()
+        try:
+            await slot.__aenter__()
+        except BaseException:
+            if budget_call.reservation is not None:
+                budget_call.reservation.settle(0)  # 尚未请求上游，没有模型成本。
+            raise
+        finalizer = StreamFinalizer(slot, budget_call.settle)
+        token = current_stream_finalizer.set(finalizer)
+        budget_token = _budget_call.set(budget_call)
         try:
             result = await self._call_with_fallback(messages, tools, tool_choice, **kwargs)
+            # ChatResponse 继承 DictMixin，hasattr 会把缺失字段变成 KeyError。
+            # 按类型检查异步迭代协议，且在退出异常保护前识别 SDK 吞掉的取消。
+            if isinstance(result, AsyncIterable):
+                finalizer.add(result)
+                finalizer.bind_current_task()
+                wrapped = self._release_after_stream(finalizer, result, budget_call)
+                # AgentScope 要求原生 async generator。预启动只消费内部标记，不等首个 token；
+                # finally 先就绪，调用方尚未读流就 aclose 也会释放名额和 HTTP 连接。
+                await anext(wrapped)
+                return wrapped
+            _raise_if_interrupted(result)
         except BaseException:
-            await slot.__aexit__(*sys.exc_info())
+            await finalizer.close(sys.exc_info())
             raise
+        finally:
+            current_stream_finalizer.reset(token)
+            _budget_call.reset(budget_token)
 
-        if not hasattr(result, "__aiter__"):
-            await slot.__aexit__(None, None, None)
-            return result
-        return self._release_after_stream(slot, result)
+        finalizer.last = result
+        await finalizer.close()
+        return result
+
+    def _budget_fallback(self) -> ChatResponse:
+        budget = get_budget()
+        if budget is not None:
+            budget.fallback_used = True
+        if self._bus is not None:
+            self._bus.publish(ShoppingContext.current_session_id(), "model.fallback", {
+                "from": self.model, "to": "rules", "reason": "本轮预算不足以开始新的模型调用",
+                "budget_tier": "fallback",
+            })
+        return ChatResponse(content=[TextBlock(text=rule_fallback_text())], is_last=True,
+                            metadata={"budget_fallback": True})
 
     @staticmethod
-    async def _release_after_stream(slot: Any, stream: Any) -> AsyncGenerator[ChatResponse, None]:
+    async def _release_after_stream(finalizer: StreamFinalizer, stream: Any, budget_call: BudgetCall) -> AsyncGenerator[ChatResponse, None]:
         """把闸门名额持有到流真正读完（含调用方提前中断的情况）。"""
         try:
+            yield None  # type: ignore[misc]  # 内部启动标记仅由 __call__ 消费。
+            finalizer.bind_current_task()
             async for chunk in stream:
+                finalizer.last = chunk
+                budget_call.observe_chunk(chunk)
+                _raise_if_interrupted(chunk)
                 yield chunk
         finally:
-            await slot.__aexit__(None, None, None)
+            await finalizer.close(sys.exc_info())
 
     async def _invoke_upstream(
         self,
@@ -92,8 +214,39 @@ class ThrottledChatModel(OpenAIChatModel):
         tool_choice: Optional[ToolChoice],
         **kwargs: Any,
     ) -> ChatResponse | AsyncGenerator[ChatResponse, None]:
-        """真正打上游的一跳。抽成方法便于替换与测试。"""
+        """真正打上游的一跳。抽成方法便于替换与测试。
+
+        同时是四档预算降级（16-4 章）的作用点：
+        预算充足（main）走主模型；剩余不足时切到更便宜的备用模型，
+        并发 model.fallback 事件如实告知——**降级不静默**。
+        minimal 档额外注入简洁模式提示，压住 Think 长度。
+        """
+        call = _budget_call.get()
+        tier = call.tier if call is not None else current_tier()
+        if tier != "main":
+            # 使用预留之前确定的档位；预留本身会降低 remaining，不能因此漏掉 hint。
+            hint = MINIMAL_MODE_HINT if tier == "minimal" else None
+            if hint:
+                messages = [*messages, Msg(name="system", content=[TextBlock(text=hint)], role="system")]
+            if self._fallback is not None:
+                logger.info("Token 预算档位 %s，切用备用模型 %s", tier, self._fallback.model)
+                self._publish_budget_tier(tier)
+                return await self._fallback(messages, tools, tool_choice, **kwargs)
         return await super().__call__(messages, tools, tool_choice, **kwargs)
+
+    def _publish_budget_tier(self, tier: str) -> None:
+        if self._bus is None or self._fallback is None:
+            return
+        self._bus.publish(
+            ShoppingContext.current_session_id(),
+            "model.fallback",
+            {
+                "from": self.model,
+                "to": self._fallback.model,
+                "reason": f"Token 预算档位 {tier}",
+                "budget_tier": tier,
+            },
+        )
 
     async def _call_with_fallback(
         self,
@@ -103,10 +256,22 @@ class ThrottledChatModel(OpenAIChatModel):
         **kwargs: Any,
     ) -> ChatResponse | AsyncGenerator[ChatResponse, None]:
         last_error: Optional[BaseException] = None
+        budget_call = _budget_call.get()
         for attempt in range(self._max_transient_retries + 1):
+            if attempt and budget_call is not None:
+                if not budget_call.acquire():
+                    return self._budget_fallback()
+                if budget_call.budget is not None:
+                    kwargs["max_completion_tokens"] = budget_call.maximum_output
             try:
+                if budget_call is not None:
+                    budget_call.mark_started()
                 return await self._invoke_upstream(messages, tools, tool_choice, **kwargs)
-            except BaseException as err:
+            except asyncio.CancelledError:
+                raise
+            except Exception as err:
+                if budget_call is not None:
+                    budget_call.settle(None)
                 if not is_transient_error(err):
                     raise
                 last_error = err
@@ -123,7 +288,14 @@ class ThrottledChatModel(OpenAIChatModel):
             raise last_error  # type: ignore[misc]
 
         logger.warning("模型 %s 重试用尽，回退到 %s：%s", self.model, self._fallback.model, last_error)
+        if budget_call is not None:
+            if not budget_call.acquire():
+                return self._budget_fallback()
+            if budget_call.budget is not None:
+                kwargs["max_completion_tokens"] = budget_call.maximum_output
         self._publish_fallback(str(last_error))
+        if budget_call is not None:
+            budget_call.mark_started()
         return await self._fallback(messages, tools, tool_choice, **kwargs)
 
     def _publish_fallback(self, reason: str) -> None:
@@ -135,6 +307,76 @@ class ThrottledChatModel(OpenAIChatModel):
             "model.fallback",
             {"from": self.model, "to": self._fallback.model, "reason": reason},
         )
+
+
+def _safe_field(source: Any, name: str) -> Any:
+    """宽容取字段。
+
+    坑：ChatResponse.usage 的 `__getattr__` 对缺失字段抛 **KeyError**，
+    而 `getattr(obj, name, default)` 只吃 AttributeError——直接用 getattr 带默认值
+    依旧会把 KeyError 抛到主链路，把整轮对话搞成 [error]。实测踩过。
+    """
+    if isinstance(source, dict):
+        return source.get(name)
+    try:
+        return getattr(source, name, None)
+    except Exception:  # noqa: BLE001 —— 包含 KeyError 等非标准实现
+        return None
+
+
+def _raise_if_interrupted(response: Any) -> None:
+    """SDK 会把 CancelledError 转成响应或尾块；还原取消供请求层终止本轮。"""
+    if _safe_field(response, "finished_reason") == FinishedReason.INTERRUPTED:
+        raise asyncio.CancelledError("模型调用已中断")
+
+
+def _usage_tokens(response: Any) -> int | None:
+    usage = _safe_field(response, "usage") if response is not None else None
+    if usage is None:
+        return None
+    def count(value):
+        return value if type(value) is int and value >= 0 else None
+
+    total = count(_safe_field(usage, "total_tokens"))
+    prompt = count(_safe_field(usage, "input_tokens"))
+    if prompt is None:
+        prompt = count(_safe_field(usage, "prompt_tokens"))
+    output = count(_safe_field(usage, "output_tokens"))
+    if output is None:
+        output = count(_safe_field(usage, "completion_tokens"))
+    if prompt is not None and output is not None:
+        return max(prompt + output, total or 0)
+    # 单边用量缺失不可补成零；明显小于已知单边数量的 total 同样不可信。
+    if total is not None and total >= max(prompt or 0, output or 0):
+        return total
+    return None
+
+
+def _charge_budget(response: Any) -> None:
+    """把一次模型调用的 token 记进当前意图的预算账本。
+
+    未启用预算（TOKEN_BUDGET_TOTAL=0）时直接返回，零开销。
+    usage 字段各网关存在差异，取不到就不计——**记账失败绝不能影响主链路**。
+    """
+    try:
+        budget = get_budget()
+        if budget is None or response is None:
+            return
+        usage = _safe_field(response, "usage")
+        if usage is None:
+            return
+        total = _safe_field(usage, "total_tokens")
+        if total is None:
+            prompt = _safe_field(usage, "input_tokens") or _safe_field(usage, "prompt_tokens") or 0
+            completion = (
+                _safe_field(usage, "output_tokens")
+                or _safe_field(usage, "completion_tokens")
+                or 0
+            )
+            total = int(prompt) + int(completion)
+        budget.charge("llm", int(total))
+    except Exception as err:  # noqa: BLE001
+        logger.debug("Token 记账跳过（不影响主链路）：%s", err)
 
 
 def create_chat_model(
@@ -152,9 +394,12 @@ def create_chat_model(
         "stream": stream,
         # 上下文窗口：压缩触发阈值（ContextConfig.trigger_ratio）按此值比例计算
         "context_size": settings.context_size,
+        # 重试统一由外层逐次预算预留管理，避免 SDK 内部重试绕过账本。
+        "max_retries": 0,
+        "client_kwargs": {"max_retries": 0},
     }
     fallback = (
-        OpenAIChatModel(model=settings.llm_fallback_model, **common)
+        StreamClosingOpenAIChatModel(model=settings.llm_fallback_model, **common)
         if settings.llm_fallback_model and settings.llm_fallback_model != settings.llm_model
         else None
     )

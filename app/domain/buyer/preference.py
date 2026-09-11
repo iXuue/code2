@@ -27,6 +27,9 @@ class BuyerPreference:
             raise ValueError(f"BuyerPreference.kind 必须是 {VALID_KINDS}：{self.kind}")
         if not self.statement or not self.statement.strip():
             raise ValueError("BuyerPreference.statement required")
+        if len(self.statement) > 500:
+            raise ValueError("偏好不能超过 500 字符")
+        object.__setattr__(self, "statement", self.statement.strip())
         if not self.created_at:
             object.__setattr__(self, "created_at", datetime.now(timezone.utc).isoformat())
 
@@ -39,3 +42,18 @@ class PreferenceStore(ABC):
     @abstractmethod
     async def list_by_buyer(self, buyer_id: str) -> list[BuyerPreference]:
         ...
+
+    @abstractmethod
+    async def delete(self, buyer_id: str, statement: str) -> bool:
+        """按 statement **精确匹配**删除；命中返回 True，未命中返回 False。
+
+        刻意不做模糊/向量匹配：删偏好是不可逆写操作，而“不要塑料”与
+        “不要塑料包装”这类语句相似度极高，模糊匹配会误删。调用方在未命中时
+        应把现存偏好列表回给模型，让它用原文重试。
+
+        不按 kind 区分：同 statement 的 like 与 dislike 条目会一并清除。
+        """
+
+    async def replace(self, buyer_id: str, previous_statement: str, preference: BuyerPreference) -> bool:
+        """原子替换原文匹配的偏好，未命中不写入新值。"""
+        raise NotImplementedError("当前偏好存储不支持原子替换")

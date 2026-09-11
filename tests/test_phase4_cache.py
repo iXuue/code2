@@ -192,6 +192,48 @@ class TestSemanticCacheHit:
         assert await sem.lookup("b1", "露营灯推荐", has_history=False) is None
 
 
+class TestPreferenceScopedCache:
+    """偏好变化必须使旧回复失效。
+
+    真实踩过的坑：买家把“不要塑料”撤回后又问了一句语义相近的话，
+    缓存桶 key 不含偏好指纹，于是命中了撤回前的回复——里面还写着
+    “符合您不要塑料的偏好”，直接向用户断言了一条它刚删掉的偏好。
+    """
+
+    async def test_scope_change_invalidates(self):
+        cache = InMemoryCache()
+        sem = SemanticCache(cache, CountingEmbedder(), threshold=0.9)
+        await sem.remember(
+            "b1", "旅行三件套推荐", "按你不要塑料的偏好推荐 X",
+            has_history=False, scope="pref-v1",
+        )
+
+        # 偏好撤回后指纹变了，旧回复不得命中
+        assert await sem.lookup(
+            "b1", "旅行三件套推荐", has_history=False, scope="pref-v2",
+        ) is None
+
+    async def test_same_scope_still_hits(self):
+        cache = InMemoryCache()
+        sem = SemanticCache(cache, CountingEmbedder(), threshold=0.9)
+        await sem.remember(
+            "b1", "旅行三件套推荐", "推荐 X", has_history=False, scope="pref-v1",
+        )
+        hit = await sem.lookup(
+            "b1", "旅行三件套推荐", has_history=False, scope="pref-v1",
+        )
+        assert hit is not None and hit.reply == "推荐 X"
+
+    async def test_empty_scope_isolated_from_nonempty(self):
+        """从无偏好到有偏好（首次记住）同样要失效。"""
+        cache = InMemoryCache()
+        sem = SemanticCache(cache, CountingEmbedder(), threshold=0.9)
+        await sem.remember("b1", "旅行三件套推荐", "无偏好时的推荐", has_history=False)
+        assert await sem.lookup(
+            "b1", "旅行三件套推荐", has_history=False, scope="pref-v1",
+        ) is None
+
+
 class TestIdempotencyKey:
     async def test_first_wins_second_rejected(self):
         cache = InMemoryCache()

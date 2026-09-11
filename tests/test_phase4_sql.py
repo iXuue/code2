@@ -227,3 +227,36 @@ class TestPreferenceStore:
         store = SqlPreferenceStore(engine)
         await store.append(BuyerPreference(buyer_id="b1", kind="like", statement="x"))
         assert await store.list_by_buyer("b2") == []
+
+    async def test_delete_hit_and_miss(self, engine):
+        store = SqlPreferenceStore(engine)
+        await store.append(BuyerPreference(buyer_id="b1", kind="dislike", statement="不要塑料材质"))
+
+        assert await store.delete("b1", "不要塑料材质") is True
+        assert await store.list_by_buyer("b1") == []
+        assert await store.delete("b1", "不要塑料材质") is False
+
+    async def test_delete_requires_exact_match(self, engine):
+        """删偏好不可逆，不得前缀匹配误删。"""
+        store = SqlPreferenceStore(engine)
+        await store.append(BuyerPreference(buyer_id="b1", kind="dislike", statement="不要塑料材质"))
+        assert await store.delete("b1", "不要塑料") is False
+        assert len(await store.list_by_buyer("b1")) == 1
+
+    async def test_delete_removes_both_kinds_of_same_statement(self, engine):
+        """同一句话可同时存为 like 与 dislike（见上一条用例），
+        撤回时两条一并清除——买家表达的是“忘掉这条说法”。"""
+        store = SqlPreferenceStore(engine)
+        await store.append(BuyerPreference(buyer_id="b1", kind="like", statement="小众设计"))
+        await store.append(BuyerPreference(buyer_id="b1", kind="dislike", statement="小众设计"))
+
+        assert await store.delete("b1", "小众设计") is True
+        assert await store.list_by_buyer("b1") == []
+
+    async def test_delete_does_not_cross_buyers(self, engine):
+        store = SqlPreferenceStore(engine)
+        await store.append(BuyerPreference(buyer_id="b1", kind="dislike", statement="不要塑料材质"))
+        await store.append(BuyerPreference(buyer_id="b2", kind="dislike", statement="不要塑料材质"))
+
+        assert await store.delete("b1", "不要塑料材质") is True
+        assert len(await store.list_by_buyer("b2")) == 1

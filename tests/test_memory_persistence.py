@@ -46,6 +46,62 @@ class TestPreferenceStore:
             BuyerPreference(buyer_id="b1", kind="hate", statement="x")
 
 
+class TestPreferenceDelete:
+    """偏好撤回（买家说“以后不用避开塑料了”）。"""
+
+    async def test_delete_hit(self, tmp_path):
+        store = JsonFilePreferenceStore(tmp_path)
+        await store.append(BuyerPreference(buyer_id="b1", kind="dislike", statement="不要塑料材质"))
+        await store.append(BuyerPreference(buyer_id="b1", kind="like", statement="喜欢小众设计"))
+
+        assert await store.delete("b1", "不要塑料材质") is True
+        remaining = await store.list_by_buyer("b1")
+        assert [p.statement for p in remaining] == ["喜欢小众设计"]
+
+    async def test_delete_miss_returns_false_and_keeps_data(self, tmp_path):
+        store = JsonFilePreferenceStore(tmp_path)
+        await store.append(BuyerPreference(buyer_id="b1", kind="dislike", statement="不要塑料材质"))
+
+        assert await store.delete("b1", "不存在的偏好") is False
+        assert len(await store.list_by_buyer("b1")) == 1
+
+    async def test_delete_requires_exact_match(self, tmp_path):
+        """精确匹配：“不要塑料”不得误删“不要塑料材质”——删偏好不可逆。"""
+        store = JsonFilePreferenceStore(tmp_path)
+        await store.append(BuyerPreference(buyer_id="b1", kind="dislike", statement="不要塑料材质"))
+
+        assert await store.delete("b1", "不要塑料") is False
+        assert len(await store.list_by_buyer("b1")) == 1
+
+    async def test_delete_is_idempotent(self, tmp_path):
+        store = JsonFilePreferenceStore(tmp_path)
+        await store.append(BuyerPreference(buyer_id="b1", kind="like", statement="喜欢小众设计"))
+
+        assert await store.delete("b1", "喜欢小众设计") is True
+        assert await store.delete("b1", "喜欢小众设计") is False
+
+    async def test_delete_does_not_cross_buyers(self, tmp_path):
+        store = JsonFilePreferenceStore(tmp_path)
+        await store.append(BuyerPreference(buyer_id="b1", kind="dislike", statement="不要塑料材质"))
+        await store.append(BuyerPreference(buyer_id="b2", kind="dislike", statement="不要塑料材质"))
+
+        assert await store.delete("b1", "不要塑料材质") is True
+        assert len(await store.list_by_buyer("b2")) == 1, "不得跨买家串删"
+
+    async def test_delete_on_missing_buyer(self, tmp_path):
+        store = JsonFilePreferenceStore(tmp_path)
+        assert await store.delete("never-seen", "不要塑料材质") is False
+
+    async def test_reappend_after_delete(self, tmp_path):
+        """撤回后买家又改主意，应能重新写入。"""
+        store = JsonFilePreferenceStore(tmp_path)
+        pref = BuyerPreference(buyer_id="b1", kind="dislike", statement="不要塑料材质")
+        await store.append(pref)
+        await store.delete("b1", "不要塑料材质")
+        await store.append(pref)
+        assert len(await store.list_by_buyer("b1")) == 1
+
+
 class TestSessionPersistence:
     async def test_agent_state_roundtrip_via_store(self, tmp_path):
         store = JsonFileSessionStore(tmp_path)
